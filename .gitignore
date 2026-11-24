@@ -1,0 +1,14 @@
+.env
+.env.*
+! .env.example
+data/
+logs/
+tmp/
+__pycache__/
+.venv/
+*.log
+bot.lock
+voice-clone/
+webapp/
+media-generation-*.json
+*.muse-github-snapshot-sync.json
