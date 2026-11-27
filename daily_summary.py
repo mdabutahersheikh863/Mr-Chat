@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Nightly summary for the Mr Support bot (feature 6).
 
-Reads today's activity from data/history.json, data/users.json and
-logs/bot.log, asks Groq (Pollinations fallback) to summarise the
-day's topics in Bengali, and sends it to the admin via the Bot API.
+Counts-only (no AI since 2026-11-27, when the AI was removed from
+the bot on Abu's order): reads today's activity from logs/bot.log
+and sends the counts to the admin via the Bot API.
 
 Usage:
   python3 daily_summary.py            # send tonight's summary
@@ -15,18 +15,14 @@ Run with: env -u no_proxy -u NO_PROXY python3 daily_summary.py
 import json
 import re
 import sys
-import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 BASE = Path(__file__).resolve().parent
-DATA_DIR = BASE / "data"
 LOG_FILE = BASE / "logs" / "bot.log"
 DHAKA = ZoneInfo("Asia/Dhaka")
-
-OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct"
 
 
 def load_env(path: Path) -> dict:
@@ -45,14 +41,20 @@ ENV = load_env(BASE / ".env")
 TOKEN = ENV.get("BOT_TOKEN", "")
 ADMIN_ID = int(ENV.get("ADMIN_ID", "0") or 0)
 
-
-def load_json(path: Path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return default
+# Token source mirrors bot.py: when the marker data/use_vault_token
+# exists, the live bot runs on the NEW bot's vault token
+# (@Mr_Chat1bot) and the old .env token is dead (401). The summary
+# must send with the same token the bot polls with. The surrogate
+# goes RAW in the request path (urllib does not re-encode the colon).
+VAULT_TOKEN_MARKER = BASE / "data" / "use_vault_token"
+if VAULT_TOKEN_MARKER.exists():
+    try:
+        sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
+        from dynamic_credentials import dynamic_credential_entry
+        TOKEN = dynamic_credential_entry(
+            "custom.telegram-bot")["surrogate"]
+    except Exception as _exc:
+        raise SystemExit(f"vault token requested but unavailable: {_exc}")
 
 
 def day_bounds_utc(now_dhaka: datetime):
@@ -72,10 +74,8 @@ def count_from_log(start_utc, end_utc):
     """Count today's activity from bot.log (timestamps are UTC)."""
     users = set()
     to_admin = 0
-    ai_replies = 0
-    backends = {}
     if not LOG_FILE.exists():
-        return users, to_admin, ai_replies, backends
+        return users, to_admin
     for line in LOG_FILE.read_text(encoding="utf-8",
                                    errors="ignore").splitlines():
         m = LOG_LINE.match(line)
@@ -94,101 +94,18 @@ def count_from_log(start_utc, end_utc):
             to_admin += 1
             if um:
                 users.add(um.group(1))
-        elif body.startswith("ai reply to user"):
-            ai_replies += 1
-            if um:
-                users.add(um.group(1))
-        elif body.startswith("ai reply via "):
-            name = body[len("ai reply via "):].strip()
-            backends[name] = backends.get(name, 0) + 1
-    return users, to_admin, ai_replies, backends
-
-
-def todays_texts(day_start_ts: int):
-    """User message texts from today (history keeps last 10/user)."""
-    hist = load_json(DATA_DIR / "history.json", {})
-    texts = []
-    for _uid, items in hist.items():
-        for it in items:
-            if it.get("role") == "user" and it.get("ts", 0) >= day_start_ts:
-                texts.append(it.get("text", "")[:200])
-    return texts[:40]
-
-
-def summarise_topics(texts):
-    """Short Bengali topic summary via Groq, Pollinations fallback."""
-    if not texts:
-        return "আজ কোনো মেসেজ আসেনি।"
-    joined = "\n".join(f"- {t}" for t in texts)
-    prompt = ("Summarise these user messages from today in Bengali, "
-              "in 3-5 short bullet lines: which topics/problems came "
-              "up most, and anything urgent. Be concrete, no fluff.\n\n"
-              + joined)
-    # Groq first (same pattern as bot.py openrouter_reply).
-    try:
-        sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
-        from dynamic_credentials import add_surrogate_to_request
-        body = json.dumps({
-            "model": OPENROUTER_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "max_tokens": 400,
-            "provider": {"order": ["groq"], "allow_fallbacks": False},
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/chat/completions", data=body,
-            headers={"Content-Type": "application/json"})
-        add_surrogate_to_request(req, "custom.openrouter",
-                                 allowed_hosts=["openrouter.ai"])
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        ans = data["choices"][0]["message"]["content"].strip()
-        if ans:
-            return ans[:1200]
-    except Exception as e:
-        print(f"groq summary failed: {e}", file=sys.stderr)
-    # Pollinations fallback.
-    try:
-        body = json.dumps({
-            "messages": [
-                {"role": "system",
-                 "content": "Answer briefly in Bengali."},
-                {"role": "user", "content": prompt},
-            ],
-            "model": "openai", "temperature": 0,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://text.pollinations.ai/", data=body,
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            ans = resp.read().decode("utf-8", "ignore").strip()
-        if ans:
-            return ans[:1200]
-    except Exception as e:
-        print(f"pollinations summary failed: {e}", file=sys.stderr)
-    # Last resort: raw topic lines.
-    return "\n".join(f"• {t[:120]}" for t in texts[:8])
+    return users, to_admin
 
 
 def build_summary() -> str:
     now_dhaka = datetime.now(DHAKA)
     start_utc, end_utc = day_bounds_utc(now_dhaka)
-    users, to_admin, ai_replies, backends = count_from_log(start_utc,
-                                                           end_utc)
-    day_start_ts = int(start_utc.timestamp())
-    texts = todays_texts(day_start_ts)
-    topics = summarise_topics(texts)
+    users, to_admin = count_from_log(start_utc, end_utc)
     date_bn = now_dhaka.strftime("%d %B %Y")
-    backend_line = ""
-    if backends:
-        parts = [f"{k}: {v}" for k, v in sorted(backends.items())]
-        backend_line = f" ({', '.join(parts)})"
     return (
         f"📊 <b>আজকের সারাংশ — {date_bn}</b>\n\n"
         f"👥 মেসেজ পাঠিয়েছে: {len(users)} জন\n"
-        f"📨 এডমিনের কাছে গেছে: {to_admin} টি\n"
-        f"🤖 AI উত্তর দিয়েছে: {ai_replies} টি{backend_line}\n\n"
-        f"📌 <b>মূল বিষয়গুলো:</b>\n{topics}"
+        f"📨 এডমিনের কাছে গেছে: {to_admin} টি"
     )
 
 
