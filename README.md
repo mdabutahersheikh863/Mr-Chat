@@ -16,6 +16,23 @@ admin, who replies directly to the message.
   channel and gets a deep link (`t.me/Mr_Chat1bot?start=00001`); anyone
   opening it receives the file fresh. No forwarding anywhere
   (`protect_content` on). `/mediastats`, `/mediasearch`, `/mediadelete`.
+  Click stats: every successful delivery to a user is counted
+  (`/mediastats` shows total clicks, unique clickers and top links).
+- **Password links** — `/setlinkpass <code> <password>` /
+  `/dellinkpass <code>`; opening a protected link asks for the password
+  (3 tries, the attempt is never forwarded to the admin).
+- **Auto-delete** — `/setautodelete <hours>` (0 = off, max 168); delivered
+  files delete themselves after that many hours.
+- **Inline mode** — search shared files from any chat
+  (`@Mr_Chat1bot <name or File ID>`); members only, password links never
+  listed. Needs `/setinline` enabled in BotFather.
+- **My files** — `/myfiles` and the 📁 𝐌𝐲 𝐟𝐢𝐥𝐞𝐬 button: the files a user
+  opened before.
+- **Welcome** — the admin's ✏️ 𝐖𝐞𝐥𝐜𝐨𝐦𝐞 button changes the welcome text
+  (`{name}` supported), photo and voice (voice in the admin's cloned
+  voice); Reset returns to the default.
+- **Multi-admin** — `/addadmin`, `/deladmin`, `/listadmins` (main admin
+  only); user messages reach every admin.
 - **Force join** — the whole bot is gated on joining a group/channel:
   non-members get a Join button + Verify button. Leaving the group sends
   one private reminder. Join requests are auto-approved, but only when

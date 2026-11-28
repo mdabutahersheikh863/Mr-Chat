@@ -66,6 +66,20 @@
   current group). The Join button in the gate message shows the
   name given at setup (default "𝐌ʀ 𝐔ᴘᴅᴀᴛᴇꜱ", stored as
   "button_name").
+- Share-link clicks are counted (data/media.db media_clicks):
+  /mediastats shows total clicks + unique clickers + top links;
+  the Link list and /mediasearch show per-link clicks.
+- Link passwords (/setlinkpass, /dellinkpass): a password-protected
+  link asks the user for the password (3 tries) before delivering.
+- Auto-delete (/setautodelete <hours>): delivered media is deleted
+  from the user's chat after the delay (SQLite queue + sweeper).
+- Inline mode: @Mr_Chat1bot <query> in any chat lists share links
+  (members only, no password links; needs /setinline in BotFather).
+- /myfiles (+ My files button): files the user received before.
+- Welcome edit (✏️ Welcome button): text, then photo, then a voice
+  message in Abu's clone voice (data/welcome.json + welcome_voice.ogg).
+- Extra admins (/addadmin, /deladmin, /listadmins): user messages
+  reach every admin; admin management stays main-admin-only.
 """
 
 import asyncio
@@ -83,7 +97,7 @@ import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -99,6 +113,15 @@ from telegram.error import (
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InlineQueryResultCachedAudio,
+    InlineQueryResultCachedDocument,
+    InlineQueryResultCachedGif,
+    InlineQueryResultCachedPhoto,
+    InlineQueryResultCachedSticker,
+    InlineQueryResultCachedVideo,
+    InlineQueryResultCachedVoice,
+    InputTextMessageContent,
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
@@ -109,8 +132,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     ChatJoinRequestHandler,
     ChatMemberHandler,
+    ChosenInlineResultHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -453,6 +478,131 @@ def clear_share_state() -> None:
     save_share_link_state(SHARE_LINK)
 
 
+# Custom user welcome, set by the admin from the bot itself (Abu,
+# 2026-11-27): data/welcome.json {"text": str | None,
+# "photo_file_id": str | None, "voice": bool,
+# "pending": "text" | "photo" | None}. "text" overrides the STRINGS
+# "welcome" default for every language; "photo_file_id" is the
+# welcome photo (sent with the text as its caption); "voice" =
+# speak the text in Abu's clone voice after the photo (the audio
+# is generated once at setup and cached as data/welcome_voice.ogg).
+# "pending" = which setup step waits for the admin.
+WELCOME_FILE = BASE / "data" / "welcome.json"
+WELCOME_VOICE_FILE = BASE / "data" / "welcome_voice.ogg"
+
+
+def load_welcome_state() -> dict:
+    if WELCOME_FILE.exists():
+        try:
+            items = json.loads(
+                WELCOME_FILE.read_text(encoding="utf-8"))
+            return items if isinstance(items, dict) else {}
+        except Exception:
+            pass
+    return {}
+
+
+def save_welcome_state(state: dict) -> None:
+    WELCOME_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WELCOME_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+WELCOME_STATE = load_welcome_state()
+
+
+def custom_welcome() -> str | None:
+    text = WELCOME_STATE.get("text")
+    return text if isinstance(text, str) and text.strip() else None
+
+
+def welcome_photo() -> str | None:
+    photo = WELCOME_STATE.get("photo_file_id")
+    return photo if isinstance(photo, str) and photo else None
+
+
+def welcome_voice_on() -> bool:
+    return bool(WELCOME_STATE.get("voice", False))
+
+
+def welcome_voice_available() -> bool:
+    return welcome_voice_on() and WELCOME_VOICE_FILE.exists()
+
+
+def welcome_pending():
+    """None | "text" | "photo" — which welcome step waits."""
+    step = WELCOME_STATE.get("pending")
+    return step if step in ("text", "photo") else None
+
+
+def set_welcome_pending(step) -> None:
+    WELCOME_STATE["pending"] = step
+    save_welcome_state(WELCOME_STATE)
+
+
+def set_custom_welcome(text: str | None, pending=None) -> None:
+    WELCOME_STATE["text"] = text
+    WELCOME_STATE["pending"] = pending
+    save_welcome_state(WELCOME_STATE)
+
+
+def set_welcome_photo(file_id: str | None) -> None:
+    WELCOME_STATE["photo_file_id"] = file_id
+    save_welcome_state(WELCOME_STATE)
+
+
+def set_welcome_voice(on: bool) -> None:
+    WELCOME_STATE["voice"] = bool(on)
+    save_welcome_state(WELCOME_STATE)
+
+
+def reset_welcome() -> None:
+    WELCOME_STATE["text"] = None
+    WELCOME_STATE["photo_file_id"] = None
+    WELCOME_STATE["voice"] = False
+    WELCOME_STATE["pending"] = None
+    save_welcome_state(WELCOME_STATE)
+    try:
+        WELCOME_VOICE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def generate_welcome_voice(text: str) -> bool:
+    """Speak the welcome text in Abu's clone voice, once, and
+    cache it as data/welcome_voice.ogg. Returns True on success."""
+    try:
+        audio = make_voice_bytes(text)
+    except Exception:
+        log.exception("welcome voice generation failed")
+        return False
+    if not audio:
+        return False
+    try:
+        WELCOME_VOICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WELCOME_VOICE_FILE.write_bytes(audio)
+        set_welcome_voice(True)
+        return True
+    except Exception:
+        log.exception("welcome voice save failed")
+        return False
+
+
+def user_welcome_text(user, lang: str = "bn") -> str:
+    """Effective /start welcome for a user: the admin's custom text
+    when set, else the language default. {name} becomes the user's
+    first name; {owner}/{lang}/{help} are the button labels."""
+    custom = custom_welcome()
+    if custom is None:
+        return t("welcome", lang)
+    try:
+        return custom.format(
+            name=user.first_name, owner=BTN_OWNER,
+            lang=BTN_LANG, help=BTN_HELP)
+    except Exception:
+        return custom
+
+
 MEDIA_DB_FILE = BASE / "data" / "media.db"
 MEDIA_LOCK = threading.Lock()
 
@@ -478,6 +628,29 @@ def media_db_init() -> None:
             "original_caption TEXT,"
             "upload_date TEXT NOT NULL,"
             "uploader_id INTEGER NOT NULL)")
+        # One row per share-link click (a successful media
+        # delivery to a user). Added 2026-11-27 for click stats.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS media_clicks ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "file_id_5digit TEXT NOT NULL,"
+            "user_id INTEGER NOT NULL,"
+            "clicked_at TEXT NOT NULL)")
+        # Auto-delete queue (Abu, 2026-11-27): delivered messages
+        # waiting to be deleted from the user's chat.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_deletes ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "chat_id INTEGER NOT NULL,"
+            "message_id INTEGER NOT NULL,"
+            "delete_at TEXT NOT NULL)")
+        # Password-protected share links (Abu, 2026-11-27): a
+        # password per File ID; the password itself is a simple
+        # share code, not a credential.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS media_passwords ("
+            "file_id_5digit TEXT PRIMARY KEY,"
+            "password TEXT NOT NULL)")
         conn.commit()
 
 
@@ -542,7 +715,199 @@ def media_delete(code: str) -> None:
     with MEDIA_LOCK, _media_connect() as conn:
         conn.execute(
             "DELETE FROM media WHERE file_id_5digit = ?", (code,))
+        conn.execute(
+            "DELETE FROM media_clicks WHERE file_id_5digit = ?",
+            (code,))
+        conn.execute(
+            "DELETE FROM media_passwords WHERE file_id_5digit = ?",
+            (code,))
         conn.commit()
+
+
+def media_record_click(code: str, user_id: int) -> None:
+    """One share-link click: a successful media delivery to a
+    non-admin user. Never raises — stats must never break a
+    delivery."""
+    try:
+        with MEDIA_LOCK, _media_connect() as conn:
+            conn.execute(
+                "INSERT INTO media_clicks (file_id_5digit, user_id,"
+                " clicked_at) VALUES (?, ?, ?)",
+                (code, user_id,
+                 datetime.now(DHAKA).strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+    except Exception:
+        log.exception("media click record failed for %s", code)
+
+
+def media_click_stats() -> tuple:
+    """(total_clicks, unique_users, per_code) where per_code is a
+    list of (code, clicks, unique_users), most-clicked first."""
+    with MEDIA_LOCK, _media_connect() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM media_clicks").fetchone()[0]
+        users = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM media_clicks"
+            ).fetchone()[0]
+        per_code = conn.execute(
+            "SELECT file_id_5digit, COUNT(*), "
+            "COUNT(DISTINCT user_id) FROM media_clicks "
+            "GROUP BY file_id_5digit "
+            "ORDER BY COUNT(*) DESC").fetchall()
+    return total, users, [(r[0], r[1], r[2]) for r in per_code]
+
+
+def media_click_counts() -> dict:
+    """code -> (clicks, unique_users) for every clicked link."""
+    _, _, per_code = media_click_stats()
+    return {code: (clicks, users) for code, clicks, users in per_code}
+
+
+def media_search(query: str, limit: int = 20):
+    """Share links matching a File ID, filename or caption
+    (for inline search and /myfiles). Empty query = latest."""
+    with MEDIA_LOCK, _media_connect() as conn:
+        if query:
+            like = ("%" + query.replace("\\", "\\\\")
+                    .replace("%", "\\%").replace("_", "\\_") + "%")
+            return conn.execute(
+                "SELECT * FROM media WHERE file_id_5digit LIKE ? "
+                "ESCAPE '\\' OR original_filename LIKE ? ESCAPE '\\' "
+                "OR original_caption LIKE ? ESCAPE '\\' "
+                "ORDER BY id DESC LIMIT ?",
+                (like, like, like, limit)).fetchall()
+        return conn.execute(
+            "SELECT * FROM media ORDER BY id DESC LIMIT ?",
+            (limit,)).fetchall()
+
+
+def media_user_files(user_id: int, limit: int = 15):
+    """File IDs this user received (clicked), newest first —
+    only links that still exist. For /myfiles."""
+    with MEDIA_LOCK, _media_connect() as conn:
+        return conn.execute(
+            "SELECT c.file_id_5digit FROM media_clicks c "
+            "JOIN media m ON m.file_id_5digit = c.file_id_5digit "
+            "WHERE c.user_id = ? GROUP BY c.file_id_5digit "
+            "ORDER BY MAX(c.id) DESC LIMIT ?",
+            (user_id, limit)).fetchall()
+
+
+# ---------------- Link passwords ----------------
+
+def link_password_set(code: str, password: str) -> None:
+    with MEDIA_LOCK, _media_connect() as conn:
+        conn.execute(
+            "INSERT INTO media_passwords (file_id_5digit, password) "
+            "VALUES (?, ?) ON CONFLICT(file_id_5digit) "
+            "DO UPDATE SET password = excluded.password",
+            (code, password))
+        conn.commit()
+
+
+def link_password_get(code: str):
+    with MEDIA_LOCK, _media_connect() as conn:
+        row = conn.execute(
+            "SELECT password FROM media_passwords "
+            "WHERE file_id_5digit = ?", (code,)).fetchone()
+        return row[0] if row else None
+
+
+def link_password_has(code: str) -> bool:
+    return link_password_get(code) is not None
+
+
+def link_password_delete(code: str) -> None:
+    with MEDIA_LOCK, _media_connect() as conn:
+        conn.execute(
+            "DELETE FROM media_passwords WHERE file_id_5digit = ?",
+            (code,))
+        conn.commit()
+
+
+# Link-password attempts waiting for a user's reply:
+# {user_id: {"code": code, "tries": n}}. In-memory only — a
+# restart clears it and the user just re-opens the link. The
+# password attempt itself is NEVER forwarded to the admin.
+PASSWORD_PENDING: dict = {}
+
+
+# ---------------- Auto-delete ----------------
+# data/autodelete.json {"hours": 0}: 0 = off, else delete delivered
+# media from the user's chat that many hours after delivery.
+
+AUTODELETE_FILE = BASE / "data" / "autodelete.json"
+
+
+def autodelete_hours() -> int:
+    if AUTODELETE_FILE.exists():
+        try:
+            items = json.loads(
+                AUTODELETE_FILE.read_text(encoding="utf-8"))
+            hours = int(items.get("hours", 0))
+            return hours if hours > 0 else 0
+        except Exception:
+            pass
+    return 0
+
+
+def set_autodelete_hours(hours: int) -> None:
+    AUTODELETE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTODELETE_FILE.write_text(
+        json.dumps({"hours": int(hours)}, ensure_ascii=False,
+                   indent=2),
+        encoding="utf-8")
+
+
+def schedule_autodelete(chat_id: int, message_ids) -> None:
+    """Queue delivered messages for deletion. Never raises."""
+    hours = autodelete_hours()
+    if hours <= 0 or not message_ids:
+        return
+    try:
+        delete_at = (datetime.now(DHAKA)
+                     + timedelta(hours=hours)).strftime(
+                         "%Y-%m-%d %H:%M:%S")
+        with MEDIA_LOCK, _media_connect() as conn:
+            conn.executemany(
+                "INSERT INTO pending_deletes (chat_id, message_id,"
+                " delete_at) VALUES (?, ?, ?)",
+                [(chat_id, mid, delete_at) for mid in message_ids])
+            conn.commit()
+    except Exception:
+        log.exception("schedule autodelete failed")
+
+
+async def autodelete_sweep_once(bot) -> None:
+    """Delete due queued messages (one pass of the sweeper)."""
+    now = datetime.now(DHAKA).strftime("%Y-%m-%d %H:%M:%S")
+    with MEDIA_LOCK, _media_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, chat_id, message_id FROM pending_deletes "
+            "WHERE delete_at <= ?", (now,)).fetchall()
+    for row in rows:
+        try:
+            await bot.delete_message(chat_id=row["chat_id"],
+                                     message_id=row["message_id"])
+        except Exception as e:
+            log.warning("autodelete %s/%s failed: %s",
+                        row["chat_id"], row["message_id"], e)
+        with MEDIA_LOCK, _media_connect() as conn:
+            conn.execute(
+                "DELETE FROM pending_deletes WHERE id = ?",
+                (row["id"],))
+            conn.commit()
+
+
+async def autodelete_loop(app: Application) -> None:
+    """Background sweeper: every minute, delete due messages.
+    Rows persist in SQLite, so a restart never loses the queue."""
+    while True:
+        try:
+            await autodelete_sweep_once(app.bot)
+        except Exception:
+            log.exception("autodelete sweep failed")
+        await asyncio.sleep(60)
 
 
 def media_share_link(code: str) -> str:
@@ -617,46 +982,67 @@ async def copy_media_to_storage(context, msg, caption: str) -> int:
         return sent.message_id
 
 
-async def send_stored_media(context, chat_id: int, row) -> bool:
+async def send_stored_media(context, chat_id: int, row,
+                            autodelete: bool = False) -> bool:
     """Send stored media fresh from its Telegram file_id — never
     forwarded, so no "Forwarded from" tag. protect_content=True on
     every send blocks forwarding/saving. The ORIGINAL caption from
-    the DB is used (never the channel's internal caption)."""
+    the DB is used (never the channel's internal caption).
+    autodelete=True queues the sent messages for deletion after
+    the configured delay (user deliveries only, never the admin)."""
     mtype = row["media_type"]
     file_id = row["telegram_file_id"]
     caption = row["original_caption"] or None
     bot = context.bot
+    sent_ids = []
     try:
         if mtype == "photo":
-            await bot.send_photo(chat_id, photo=file_id, caption=caption,
-                                 protect_content=True)
+            sent = await bot.send_photo(
+                chat_id, photo=file_id, caption=caption,
+                protect_content=True)
+            sent_ids.append(sent.message_id)
         elif mtype == "video":
-            await bot.send_video(chat_id, video=file_id, caption=caption,
-                                 protect_content=True)
+            sent = await bot.send_video(
+                chat_id, video=file_id, caption=caption,
+                protect_content=True)
+            sent_ids.append(sent.message_id)
         elif mtype == "document":
-            await bot.send_document(chat_id, document=file_id,
-                                    caption=caption, protect_content=True)
+            sent = await bot.send_document(
+                chat_id, document=file_id, caption=caption,
+                protect_content=True)
+            sent_ids.append(sent.message_id)
         elif mtype == "audio":
-            await bot.send_audio(chat_id, audio=file_id, caption=caption,
-                                 protect_content=True)
+            sent = await bot.send_audio(
+                chat_id, audio=file_id, caption=caption,
+                protect_content=True)
+            sent_ids.append(sent.message_id)
         elif mtype == "voice":
-            await bot.send_voice(chat_id, voice=file_id, caption=caption,
-                                 protect_content=True)
+            sent = await bot.send_voice(
+                chat_id, voice=file_id, caption=caption,
+                protect_content=True)
+            sent_ids.append(sent.message_id)
         elif mtype == "animation":
-            await bot.send_animation(chat_id, animation=file_id,
-                                     caption=caption, protect_content=True)
+            sent = await bot.send_animation(
+                chat_id, animation=file_id, caption=caption,
+                protect_content=True)
+            sent_ids.append(sent.message_id)
         elif mtype == "sticker":
-            await bot.send_sticker(chat_id, sticker=file_id,
-                                   protect_content=True)
+            sent = await bot.send_sticker(
+                chat_id, sticker=file_id, protect_content=True)
+            sent_ids.append(sent.message_id)
         elif mtype == "video_note":
-            await bot.send_video_note(chat_id, video_note=file_id,
-                                      protect_content=True)
+            sent = await bot.send_video_note(
+                chat_id, video_note=file_id, protect_content=True)
+            sent_ids.append(sent.message_id)
         else:
             log.warning("send_stored_media: unknown type %s", mtype)
             return False
         if caption and mtype in ("sticker", "video_note"):
-            await bot.send_message(chat_id, text=caption,
-                                   protect_content=True)
+            sent2 = await bot.send_message(chat_id, text=caption,
+                                           protect_content=True)
+            sent_ids.append(sent2.message_id)
+        if autodelete and sent_ids:
+            schedule_autodelete(chat_id, sent_ids)
         return True
     except Exception:
         log.exception("send_stored_media failed type=%s", mtype)
@@ -737,11 +1123,18 @@ async def show_link_list(msg) -> None:
             "নতুন লিংক বানাতে 𝐂𝐫𝐞𝐚𝐭𝐞 𝐥𝐢𝐧𝐤 চাপুন।",
             reply_markup=share_link_keyboard())
         return
+    try:
+        counts = media_click_counts()
+    except Exception:
+        counts = {}
     lines = ["🔗 <b>লিংক তালিকা</b> (সর্বশেষ 15টি)\n"]
     for row in rows:
         code = row["file_id_5digit"]
-        lines.append(f"File ID: <code>{code}</code>\n"
-                     f"{media_share_link(code)}")
+        clicks, users = counts.get(code, (0, 0))
+        lock = " 🔒" if link_password_has(code) else ""
+        lines.append(f"File ID: <code>{code}</code>{lock}\n"
+                     f"{media_share_link(code)}\n"
+                     f"👆 {clicks} ক্লিক ({users} জন)")
     await msg.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML,
                          reply_markup=share_link_keyboard())
 
@@ -878,6 +1271,12 @@ async def force_join_post_init(app: Application) -> None:
         await ensure_bot_invite_link(app.bot)
     except Exception:
         pass
+    # Auto-delete sweeper: deletes delivered media from users'
+    # chats once their delay expires (rows persist in SQLite).
+    try:
+        asyncio.create_task(autodelete_loop(app))
+    except Exception:
+        log.exception("autodelete loop start failed")
 
 
 def force_join_markup(code: str) -> InlineKeyboardMarkup:
@@ -996,14 +1395,32 @@ async def force_join_callback(update: Update,
             log.warning("force join re-prompt edit failed",
                         exc_info=True)
         return
+    chat_id = query.message.chat_id if query.message else user.id
+    pw = link_password_get(code)
+    if pw and not is_admin(user.id):
+        PASSWORD_PENDING[user.id] = {"code": code, "tries": 0}
+        await query.answer("🔒 পাসওয়ার্ড লাগবে।")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🔒 <b>এই ফাইলটি পাসওয়ার্ড সুরক্ষিত</b>\n\n"
+                 "ফাইল পেতে পাসওয়ার্ডটি লিখে পাঠান।",
+            parse_mode=ParseMode.HTML)
+        return
     await query.answer("✅ ধন্যবাদ! ফাইল পাঠানো হচ্ছে।")
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-    chat_id = query.message.chat_id if query.message else user.id
-    ok = await send_stored_media(context, chat_id, row)
-    if not ok:
+    ok = await send_stored_media(context, chat_id, row,
+                                 autodelete=not is_admin(user.id))
+    if ok:
+        if not is_admin(user.id):
+            media_record_click(code, user.id)
+    else:
         await context.bot.send_message(
             chat_id=chat_id,
             text="Sorry, this file could not be found.")
@@ -1486,8 +1903,13 @@ LBL_REMOVE_LINK = "Remove link"
 LBL_CREATE_LINK = "Create link"
 LBL_FORCE_CREATE = "Force Create"
 LBL_FORCE_JOIN = "Force Join"
+LBL_WELCOME = "Welcome"
+LBL_WELCOME_RESET = "Reset welcome"
+LBL_WELCOME_VOICE_ON = "Welcome voice: ON"
+LBL_WELCOME_VOICE_OFF = "Welcome voice: OFF"
 LBL_FJ_REMOVE = "Remove"
 LBL_FJ_LIST = "List"
+LBL_MYFILES = "My files"
 
 BTN_HELP = "❓ " + to_bold(LBL_HELP)
 BTN_BROADCAST = "📢 " + to_bold(LBL_BROADCAST)
@@ -1503,12 +1925,54 @@ BTN_CREATE_LINK = "➕ " + to_bold(LBL_CREATE_LINK)
 BTN_SHARE_CANCEL = "❌ " + to_bold(LBL_CANCEL)
 BTN_FORCE_CREATE = "🔐 " + to_bold(LBL_FORCE_CREATE)
 BTN_FORCE_JOIN = "📌 " + to_bold(LBL_FORCE_JOIN)
+BTN_WELCOME = "✏️ " + to_bold(LBL_WELCOME)
+BTN_WELCOME_RESET = "↩️ " + to_bold(LBL_WELCOME_RESET)
 BTN_FJ_REMOVE = "🗑️ " + to_bold(LBL_FJ_REMOVE)
 BTN_FJ_LIST = "📋 " + to_bold(LBL_FJ_LIST)
+BTN_MYFILES = "📁 " + to_bold(LBL_MYFILES)
+
+
+# Extra admins (Abu, 2026-11-27): the main admin (ADMIN_ID) can add
+# more admins with /addadmin. Extra admins get the full admin
+# keyboard, inbox copies and all admin commands — except managing
+# admins, which stays main-admin-only. data/admins.json holds them.
+ADMINS_FILE = BASE / "data" / "admins.json"
+
+
+def load_extra_admins() -> set:
+    if ADMINS_FILE.exists():
+        try:
+            items = json.loads(
+                ADMINS_FILE.read_text(encoding="utf-8"))
+            if isinstance(items, dict) \
+                    and isinstance(items.get("admins"), list):
+                return {int(x) for x in items["admins"]}
+        except Exception:
+            pass
+    return set()
+
+
+def save_extra_admins(admins: set) -> None:
+    ADMINS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ADMINS_FILE.write_text(
+        json.dumps({"admins": sorted(admins)}, ensure_ascii=False,
+                   indent=2),
+        encoding="utf-8")
+
+
+EXTRA_ADMINS = load_extra_admins()
+
+
+def all_admin_ids() -> list:
+    """Main admin first, then extra admins (for inbox copies)."""
+    ids = [ADMIN_ID] if ADMIN_ID else []
+    ids.extend(sorted(EXTRA_ADMINS - {ADMIN_ID}))
+    return ids
 
 
 def is_admin(user_id: int) -> bool:
-    return bool(ADMIN_ID) and user_id == ADMIN_ID
+    return bool(ADMIN_ID) and (user_id == ADMIN_ID
+                               or user_id in EXTRA_ADMINS)
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
@@ -1517,7 +1981,8 @@ def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton(BTN_HELP, style="primary"),
           KeyboardButton(BTN_OWNER, style="danger")],
-         [KeyboardButton(BTN_LANG, style="primary")]],
+         [KeyboardButton(BTN_LANG, style="primary"),
+          KeyboardButton(BTN_MYFILES, style="primary")]],
         resize_keyboard=True)
 
 
@@ -1529,7 +1994,8 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
           KeyboardButton(BTN_STATS, style="success")],
          [KeyboardButton(t2v, style="primary")],
          [KeyboardButton(BTN_SHARE_LINK, style="primary")],
-         [KeyboardButton(BTN_FORCE_CREATE, style="primary")]],
+         [KeyboardButton(BTN_FORCE_CREATE, style="primary")],
+         [KeyboardButton(BTN_WELCOME, style="primary")]],
         resize_keyboard=True)
 
 
@@ -1555,6 +2021,20 @@ def force_create_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True)
 
 
+def welcome_keyboard() -> ReplyKeyboardMarkup:
+    """Welcome-edit submenu: voice toggle / Reset (back to the
+    default welcome) / Cancel. Shown only to the admin after
+    tapping Welcome."""
+    voice_on = welcome_voice_on()
+    toggle = ("🔊 " + to_bold(LBL_WELCOME_VOICE_ON) if voice_on
+              else "🔊 " + to_bold(LBL_WELCOME_VOICE_OFF))
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(toggle, style="primary")],
+         [KeyboardButton(BTN_WELCOME_RESET, style="primary")],
+         [KeyboardButton(BTN_SHARE_CANCEL, style="danger")]],
+        resize_keyboard=True)
+
+
 WELCOME_ADMIN = (
     "👑 <b>এডমিন প্যানেল</b>\n\n"
     "ইউজারের মেসেজ এভাবে আসবে:\n"
@@ -1568,7 +2048,8 @@ WELCOME_ADMIN = (
     "📁 মিডিয়া: <code>/mediastats</code> • <code>/mediasearch 00001</code> • <code>/mediadelete 00001</code>\n"
     "🔒 ফোর্স জয়েন: পুরো বট ব্যবহার করতে গ্রুপে জয়েন করতে হবে\n"
     "   (ডিফল্ট গ্রুপ কোডে সেট করা; data/force_join.json দিয়ে বদলানো যায়)\n"
-    "🔐 ফোর্স ক্রিয়েট: 🔐 𝐅𝐨𝐫𝐜𝐞 𝐂𝐫𝐞𝐚𝐭𝐞 বাটন — ফোর্স জয়েন সেটআপ / তালিকা / মুছুন\n\n"
+    "🔐 ফোর্স ক্রিয়েট: 🔐 𝐅𝐨𝐫𝐜𝐞 𝐂𝐫𝐞𝐚𝐭𝐞 বাটন — ফোর্স জয়েন সেটআপ / তালিকা / মুছুন\n"
+    "✏️ ওয়েলকাম: ✏️ 𝐖𝐞𝐥𝐜𝐨𝐦𝐞 বাটন — স্বাগতম লেখা, ফটো ও ভয়েস বদলান\n\n"
     "🪪 মালিকের পরিচয় / তথ্য (শুধু আপনি):\n"
     "• <code>/setintro আপনার পরিচয়</code>\n"
     "• <code>/addinfo তথ্য</code> — তথ্য যোগ করুন\n"
@@ -2466,11 +2947,88 @@ async def urgent_alert(context: ContextTypes.DEFAULT_TYPE,
         log.warning("urgent alert failed: %s", e)
 
 
+async def _send_user_message_to_admin(context, msg, user, header,
+                                    text, admin_id, token=None):
+    """One admin copy of a user message. Returns sent message ids.
+    The translate token (text messages) is created once by the
+    caller and shared by every admin copy."""
+    sent_ids = []
+    if msg.photo:
+        # Photo (with or without a caption). Telegram captions
+        # cap at 1024 chars, so a long caption goes as a
+        # follow-up text instead of being silently cut.
+        full_caption = (header + "\nমেসেজ👇\n\n"
+                        + (text or "📷 ছবি পাঠিয়েছে"))
+        if len(full_caption) <= 1000:
+            sent = await context.bot.send_photo(
+                chat_id=admin_id, photo=msg.photo[-1].file_id,
+                caption=full_caption)
+            sent_ids.append(sent.message_id)
+        else:
+            sent = await context.bot.send_photo(
+                chat_id=admin_id, photo=msg.photo[-1].file_id,
+                caption=header + "\nমেসেজ👇\n\n📷 ছবি পাঠিয়েছে")
+            sent_ids.append(sent.message_id)
+            sent2 = await context.bot.send_message(
+                chat_id=admin_id, text=full_caption)
+            sent_ids.append(sent2.message_id)
+    elif (msg.video or msg.document or msg.animation or msg.audio
+          or msg.voice or msg.sticker or msg.video_note):
+        # Media with or without a caption: the media itself must
+        # reach the admin. The caption travels with the copied
+        # media (copy_message keeps it) — before this fix, a
+        # captioned video/file only sent its caption as text.
+        if msg.voice:
+            kind = "(ভয়েস পাঠিয়েছে)"
+        elif msg.video:
+            kind = "(ভিডিও পাঠিয়েছে)"
+        elif msg.document:
+            kind = "(ফাইল পাঠিয়েছে)"
+        elif msg.sticker:
+            kind = "(স্টিকার পাঠিয়েছে)"
+        elif msg.animation:
+            kind = "(GIF পাঠিয়েছে)"
+        elif msg.audio:
+            kind = "(অডিও পাঠিয়েছে)"
+        elif msg.video_note:
+            kind = "(ভিডিও নোট পাঠিয়েছে)"
+        else:
+            kind = "(ছবি/ফাইল/স্টিকার পাঠিয়েছে)"
+        sent = await context.bot.send_message(
+            chat_id=admin_id,
+            text=header + "\nমেসেজ👇\n\n" + kind)
+        sent_ids.append(sent.message_id)
+        copied = await context.bot.copy_message(
+            chat_id=admin_id, from_chat_id=msg.chat_id,
+            message_id=msg.message_id)
+        sent_ids.append(copied.message_id)
+    elif text:
+        full = header + "\nমেসেজ👇\n\n" + text
+        markup = (_admin_msg_markup(token, _ADMIN_MSG[token])
+                  if token else None)
+        sent = await context.bot.send_message(
+            chat_id=admin_id, text=full, reply_markup=markup)
+        sent_ids.append(sent.message_id)
+    else:
+        # Anything else (contact, location, ...): header + copy.
+        sent = await context.bot.send_message(
+            chat_id=admin_id,
+            text=header + "\nমেসেজ👇\n\n"
+            + "(ছবি/ফাইল/স্টিকার পাঠিয়েছে)")
+        sent_ids.append(sent.message_id)
+        copied = await context.bot.copy_message(
+            chat_id=admin_id, from_chat_id=msg.chat_id,
+            message_id=msg.message_id)
+        sent_ids.append(copied.message_id)
+    return sent_ids
+
+
 async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE,
                         msg) -> None:
-    """Send the user's message to the admin as plain text (no forward).
+    """Send the user's message to every admin as plain text (no
+    forward) — the main admin plus any extra admins (/addadmin).
 
-    Stores admin-message-id -> user-id so the admin's direct reply
+    Stores admin-message-id -> user-id so any admin's direct reply
     to it can be routed back to the user.
     """
     user = update.effective_user
@@ -2480,95 +3038,43 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE,
     })
     header = admin_header(user)
     text = (msg.text or msg.caption or "").strip()
-    try:
-        sent_ids = []
-        if msg.photo:
-            # Photo (with or without a caption). Telegram captions
-            # cap at 1024 chars, so a long caption goes as a
-            # follow-up text instead of being silently cut.
-            full_caption = (header + "\nমেসেজ👇\n\n"
-                            + (text or "📷 ছবি পাঠিয়েছে"))
-            if len(full_caption) <= 1000:
-                sent = await context.bot.send_photo(
-                    chat_id=ADMIN_ID, photo=msg.photo[-1].file_id,
-                    caption=full_caption)
-                sent_ids.append(sent.message_id)
-            else:
-                sent = await context.bot.send_photo(
-                    chat_id=ADMIN_ID, photo=msg.photo[-1].file_id,
-                    caption=header + "\nমেসেজ👇\n\n📷 ছবি পাঠিয়েছে")
-                sent_ids.append(sent.message_id)
-                sent2 = await context.bot.send_message(
-                    chat_id=ADMIN_ID, text=full_caption)
-                sent_ids.append(sent2.message_id)
-        elif (msg.video or msg.document or msg.animation or msg.audio
-              or msg.voice or msg.sticker or msg.video_note):
-            # Media with or without a caption: the media itself must
-            # reach the admin. The caption travels with the copied
-            # media (copy_message keeps it) — before this fix, a
-            # captioned video/file only sent its caption as text.
-            if msg.voice:
-                kind = "(ভয়েস পাঠিয়েছে)"
-            elif msg.video:
-                kind = "(ভিডিও পাঠিয়েছে)"
-            elif msg.document:
-                kind = "(ফাইল পাঠিয়েছে)"
-            elif msg.sticker:
-                kind = "(স্টিকার পাঠিয়েছে)"
-            elif msg.animation:
-                kind = "(GIF পাঠিয়েছে)"
-            elif msg.audio:
-                kind = "(অডিও পাঠিয়েছে)"
-            elif msg.video_note:
-                kind = "(ভিডিও নোট পাঠিয়েছে)"
-            else:
-                kind = "(ছবি/ফাইল/স্টিকার পাঠিয়েছে)"
-            sent = await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=header + "\nমেসেজ👇\n\n" + kind)
-            sent_ids.append(sent.message_id)
-            copied = await context.bot.copy_message(
-                chat_id=ADMIN_ID, from_chat_id=msg.chat_id,
-                message_id=msg.message_id)
-            sent_ids.append(copied.message_id)
-        elif text:
-            token = f"{user.id}:{int(time.time())}"
-            full = header + "\nমেসেজ👇\n\n" + text
-            to_lang = "en" if detect_msg_lang(text) == "bn" else "bn"
-            if len(_ADMIN_MSG) > 500:  # keep the in-memory store bounded
-                for _k in list(_ADMIN_MSG)[:len(_ADMIN_MSG) - 500]:
-                    _ADMIN_MSG.pop(_k, None)
-            _ADMIN_MSG[token] = {"text": text, "user_id": user.id,
-                                 "full": full, "to_lang": to_lang,
-                                 "translated": {}, "shown_lang": None}
-            sent = await context.bot.send_message(
-                chat_id=ADMIN_ID, text=full,
-                reply_markup=_admin_msg_markup(token, _ADMIN_MSG[token]))
-            sent_ids.append(sent.message_id)
-        else:
-            # Anything else (contact, location, ...): header + copy.
-            sent = await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=header + "\nমেসেজ👇\n\n"
-                + "(ছবি/ফাইল/স্টিকার পাঠিয়েছে)")
-            sent_ids.append(sent.message_id)
-            copied = await context.bot.copy_message(
-                chat_id=ADMIN_ID, from_chat_id=msg.chat_id,
-                message_id=msg.message_id)
-            sent_ids.append(copied.message_id)
-        threads = DATA.setdefault("threads", {})
-        for mid in sent_ids:
-            threads[str(mid)] = user.id
-        DATA["forwarded"] = DATA.get("forwarded", 0) + 1
-        save_data(DATA)
-        log.info("sent message from user %s to admin (admin_msg_ids=%s)",
-                 user.id, sent_ids)
-        if is_urgent(text):
-            await urgent_alert(context, user, text)
-    except Exception as e:
-        log.error("send to admin failed for user %s: %s", user.id, e)
+    # Translate token (text messages only), created once and shared
+    # by every admin copy.
+    token = None
+    if text and not msg.photo and not (msg.video or msg.document
+                                       or msg.animation or msg.audio
+                                       or msg.voice or msg.sticker
+                                       or msg.video_note):
+        token = f"{user.id}:{int(time.time())}"
+        to_lang = "en" if detect_msg_lang(text) == "bn" else "bn"
+        if len(_ADMIN_MSG) > 500:  # keep the in-memory store bounded
+            for _k in list(_ADMIN_MSG)[:len(_ADMIN_MSG) - 500]:
+                _ADMIN_MSG.pop(_k, None)
+        _ADMIN_MSG[token] = {"text": text, "user_id": user.id,
+                             "full": header + "\nমেসেজ👇\n\n" + text,
+                             "to_lang": to_lang,
+                             "translated": {}, "shown_lang": None}
+    sent_ids = []
+    for admin_id in all_admin_ids():
+        try:
+            sent_ids.extend(await _send_user_message_to_admin(
+                context, msg, user, header, text, admin_id, token))
+        except Exception as e:
+            log.error("send to admin %s failed for user %s: %s",
+                      admin_id, user.id, e)
+    if not sent_ids:
         await msg.reply_text(
             t("send_failed", get_lang(user.id)))
+        return
+    threads = DATA.setdefault("threads", {})
+    for mid in sent_ids:
+        threads[str(mid)] = user.id
+    DATA["forwarded"] = DATA.get("forwarded", 0) + 1
+    save_data(DATA)
+    log.info("sent message from user %s to admins (admin_msg_ids=%s)",
+             user.id, sent_ids)
+    if is_urgent(text):
+        await urgent_alert(context, user, text)
 
 
 # ---------------- handlers ----------------
@@ -2576,17 +3082,55 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE,
 async def send_user_welcome(context, chat_id: int, user) -> None:
     """The normal plain-/start welcome for a non-admin user.
     Also used after a successful 'start'-context force-join
-    verify, so the welcome is identical in both paths."""
+    verify, so the welcome is identical in both paths.
+    Custom welcome (Abu, 2026-11-27): photo + caption first,
+    then a voice message in Abu's clone voice; the keyboard
+    rides on the last message. No custom welcome set: the
+    default text welcome, as before."""
     DATA["users"].setdefault(str(user.id), {
         "name": user.full_name,
         "username": user.username or "",
     })
     save_data(DATA)
     lang = get_lang(user.id)
-    await context.bot.send_message(
-        chat_id=chat_id, text=t("welcome", lang),
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard())
+    text = user_welcome_text(user, lang)
+    kb = main_keyboard()
+    photo = welcome_photo()
+    with_voice = welcome_voice_available()
+    # No custom welcome at all: default text, as before.
+    if custom_welcome() is None and not photo:
+        await context.bot.send_message(
+            chat_id=chat_id, text=text,
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+    photo_ok = False
+    if photo:
+        try:
+            caption = text if len(text) <= 1000 else "👋 স্বাগতম!"
+            await context.bot.send_photo(
+                chat_id, photo=photo, caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None
+                if (with_voice or len(text) > 1000) else kb)
+            photo_ok = True
+            if len(text) > 1000:
+                await context.bot.send_message(
+                    chat_id, text=text, parse_mode=ParseMode.HTML,
+                    reply_markup=None if with_voice else kb)
+        except Exception:
+            log.exception("welcome photo failed; clearing it")
+            set_welcome_photo(None)
+    if not photo_ok:
+        await context.bot.send_message(
+            chat_id, text=text, parse_mode=ParseMode.HTML,
+            reply_markup=None if with_voice else kb)
+    if with_voice:
+        try:
+            await context.bot.send_voice(
+                chat_id, voice=WELCOME_VOICE_FILE.read_bytes(),
+                reply_markup=kb)
+        except Exception:
+            log.exception("welcome voice send failed")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2619,9 +3163,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     FJ_PROMPT_TEXT, parse_mode=ParseMode.HTML,
                     reply_markup=force_join_markup(code))
                 return
+        # Password-protected link: ask for the password first.
+        pw = link_password_get(code)
+        if pw and not is_admin(user.id):
+            PASSWORD_PENDING[user.id] = {"code": code, "tries": 0}
+            await update.message.reply_text(
+                "🔒 <b>এই ফাইলটি পাসওয়ার্ড সুরক্ষিত</b>\n\n"
+                "ফাইল পেতে পাসওয়ার্ডটি লিখে পাঠান।",
+                parse_mode=ParseMode.HTML)
+            return
         ok = await send_stored_media(context, update.effective_chat.id,
-                                     row)
-        if not ok:
+                                     row,
+                                     autodelete=not is_admin(user.id))
+        if ok:
+            if not is_admin(user.id):
+                media_record_click(code, user.id)
+        else:
             await update.message.reply_text(
                 "Sorry, this file could not be found.")
         return
@@ -2880,6 +3437,97 @@ async def handle_admin_message(update: Update,
             # (e.g. a reply to a user): leave the submenu and let
             # the normal admin handling below take it.
             clear_force_state()
+    # --- Welcome edit: checked before the generic handlers so the
+    # new welcome text/photo is captured instead of being forwarded
+    # as a reply to a user. Steps: "text" then "photo". ---
+    step = welcome_pending()
+    if step is not None:
+        if plain in (LBL_WELCOME_VOICE_ON, LBL_WELCOME_VOICE_OFF):
+            set_welcome_voice(not welcome_voice_on())
+            await msg.reply_text(
+                ("🔊 ওয়েলকাম ভয়েস চালু হয়েছে।"
+                 if welcome_voice_on() else
+                 "🔇 ওয়েলকাম ভয়েস বন্ধ হয়েছে।"),
+                reply_markup=welcome_keyboard())
+            return
+        if plain == LBL_WELCOME:
+            await msg.reply_text(
+                "✏️ <b>ওয়েলকাম মেসেজ বদলান</b>\n\n"
+                "নতুন স্বাগতম মেসেজটি লিখে পাঠান।\n"
+                "এরপর ফটো পাঠাবেন, তারপর ভয়েস তৈরি হবে।\n"
+                "{name} লিখলে ইউজারের নাম বসবে।",
+                parse_mode=ParseMode.HTML,
+                reply_markup=welcome_keyboard())
+            return
+        if plain == LBL_WELCOME_RESET:
+            reset_welcome()
+            await msg.reply_text(
+                "↩️ ওয়েলকাম মেসেজ, ফটো ও ভয়েস ডিফল্টে ফিরেছে।",
+                reply_markup=admin_keyboard())
+            return
+        if plain == LBL_CANCEL:
+            set_welcome_pending(None)
+            await msg.reply_text(
+                "↩️ এডমিন প্যানেলে ফিরেছেন।",
+                reply_markup=admin_keyboard())
+            return
+        if plain in (LBL_SHARE_LINK, LBL_FORCE_CREATE,
+                     LBL_BROADCAST, LBL_STATS,
+                     LBL_T2V_ON, LBL_T2V_OFF, LBL_T2V):
+            # Leaving the welcome edit via another top-level
+            # admin button: drop the wait and let normal
+            # handling below take it.
+            set_welcome_pending(None)
+        elif step == "text":
+            if msg.text and text and text.strip():
+                new_text = text.strip()
+                if len(new_text) > 1000:
+                    await msg.reply_text(
+                        "❌ মেসেজটি অনেক বড় — ১০০০ অক্ষরের মধ্যে "
+                        "লিখে আবার পাঠান।",
+                        reply_markup=welcome_keyboard())
+                    return
+                set_custom_welcome(new_text, pending="photo")
+                await msg.reply_text(
+                    "✅ লেখা সেভ হয়েছে।\n\n"
+                    "এবার ওয়েলকাম ফটো পাঠান — না চাইলে "
+                    "Skip লিখুন।",
+                    reply_markup=welcome_keyboard())
+                return
+            await msg.reply_text(
+                "✍️ লেখা মেসেজ পাঠান — ছবি/ভয়েস দিয়ে "
+                "ওয়েলকাম লেখা বদলানো যায় না।",
+                reply_markup=welcome_keyboard())
+            return
+        elif step == "photo":
+            if msg.photo:
+                set_welcome_photo(msg.photo[-1].file_id)
+                set_welcome_pending(None)
+                voice_ok = generate_welcome_voice(
+                    custom_welcome() or "")
+                await msg.reply_text(
+                    "✅ ওয়েলকাম বদলে গেছে — ফটো + ক্যাপশন, "
+                    "তারপর ভয়েস মেসেজ যাবে।"
+                    + ("" if voice_ok else
+                       "\n⚠️ ভয়েস তৈরি হয়নি — লেখা আর ফটো "
+                       "চালু আছে, ভয়েস ছাড়াই যাবে।"),
+                    reply_markup=admin_keyboard())
+                return
+            if text and text.strip().lower() == "skip":
+                set_welcome_pending(None)
+                voice_ok = generate_welcome_voice(
+                    custom_welcome() or "")
+                await msg.reply_text(
+                    "✅ ওয়েলকাম বদলে গেছে।"
+                    + ("" if voice_ok else
+                       "\n⚠️ ভয়েস তৈরি হয়নি — লেখা চালু আছে, "
+                       "ভয়েস ছাড়াই যাবে।"),
+                    reply_markup=admin_keyboard())
+                return
+            await msg.reply_text(
+                "📷 ফটো পাঠান, অথবা Skip লিখুন।",
+                reply_markup=welcome_keyboard())
+            return
     if plain == LBL_FORCE_CREATE:
         clear_share_state()
         set_force_state(True, False)
@@ -2889,6 +3537,24 @@ async def handle_admin_message(update: Update,
             "নিচের বাটন ব্যবহার করুন।",
             parse_mode=ParseMode.HTML,
             reply_markup=force_create_keyboard())
+        return
+    if plain == LBL_WELCOME:
+        clear_share_state()
+        set_welcome_pending("text")
+        current = custom_welcome() or t("welcome", "bn")
+        photo_note = ("📷 ফটো সেট করা আছে।\n" if welcome_photo()
+                      else "")
+        voice_note = ("🔊 ভয়েস চালু আছে।\n" if welcome_voice_on()
+                      else "")
+        await msg.reply_text(
+            "✏️ <b>ওয়েলকাম মেসেজ বদলান</b>\n\n"
+            "এখনকার মেসেজ:\n" + current + "\n\n"
+            + photo_note + voice_note +
+            "নতুন স্বাগতম মেসেজটি লিখে পাঠান।\n"
+            "এরপর ফটো পাঠাবেন, তারপর ভয়েস তৈরি হবে।\n"
+            "{name} লিখলে ইউজারের নাম বসবে।",
+            parse_mode=ParseMode.HTML,
+            reply_markup=welcome_keyboard())
         return
     if plain == LBL_SHARE_LINK:
         ADMIN_FLAGS["broadcast_pending"] = False
@@ -3036,6 +3702,40 @@ async def handle_message(update: Update,
             reply_markup=force_join_markup("start"))
         return
 
+    # --- Link password: a pending password attempt is consumed
+    # here and NEVER forwarded to the admin. ---
+    pending_pw = PASSWORD_PENDING.get(user.id)
+    if pending_pw is not None and msg.text \
+            and not is_blocked(user.id):
+        code = pending_pw["code"]
+        if (msg.text or "").strip() == (link_password_get(code) or ""):
+            del PASSWORD_PENDING[user.id]
+            row = media_get_by_code(code)
+            if row is None:
+                await msg.reply_text(
+                    "Sorry, this file could not be found.")
+                return
+            ok = await send_stored_media(
+                context, user.id, row, autodelete=True)
+            if ok:
+                media_record_click(code, user.id)
+            else:
+                await msg.reply_text(
+                    "Sorry, this file could not be found.")
+            return
+        pending_pw["tries"] = pending_pw.get("tries", 0) + 1
+        if pending_pw["tries"] >= 3:
+            del PASSWORD_PENDING[user.id]
+            await msg.reply_text(
+                "❌ ৩ বার ভুল পাসওয়ার্ড দেওয়া হয়েছে — "
+                "লিংকটি আবার খুলে চেষ্টা করুন।",
+                reply_markup=main_keyboard())
+        else:
+            await msg.reply_text(
+                "❌ ভুল পাসওয়ার্ড, আবার চেষ্টা করুন।",
+                reply_markup=main_keyboard())
+        return
+
     # --- Spam auto-block (feature 11) ---
     if is_blocked(user.id):
         return  # silently ignore blocked users
@@ -3092,6 +3792,9 @@ async def handle_message(update: Update,
             "কোন ভাষায় উত্তর চান? 🙂\nWhich language do you want?\n"
             "您想要哪种语言？",
             reply_markup=markup)
+        return
+    if plain == LBL_MYFILES:
+        await show_my_files(msg, user, context)
         return
 
     # 2) Owner question: answer from the intro, do NOT send it on.
@@ -3310,12 +4013,25 @@ async def mediastats_cmd(update: Update,
             "❌ পরিসংখ্যান দেখা যায়নি, আবার চেষ্টা করুন।",
             reply_markup=admin_keyboard())
         return
+    try:
+        total_clicks, click_users, per_code = media_click_stats()
+    except Exception:
+        log.exception("mediastats clicks failed")
+        total_clicks, click_users, per_code = 0, 0, []
+    ad_hours = autodelete_hours()
     lines = ["📊 <b>মিডিয়া পরিসংখ্যান</b>\n",
              f"📁 মোট ফাইল: {total}",
-             f"🆕 সর্বশেষ ID: {latest or '—'}"]
+             f"🆕 সর্বশেষ ID: {latest or '—'}",
+             f"👆 মোট ক্লিক: {total_clicks} ({click_users} জন)",
+             f"⏳ অটো-ডিলিট: "
+             f"{str(ad_hours) + ' ঘণ্টা' if ad_hours else 'বন্ধ'}"]
     if by_type:
         lines.append("\nধরন অনুযায়ী:")
         lines.extend(f"• {t}: {c}" for t, c in sorted(by_type.items()))
+    if per_code:
+        lines.append("\nসবচেয়ে বেশি ক্লিক:")
+        lines.extend(f"• {code}: {c} ক্লিক ({u} জন)"
+                     for code, c, u in per_code[:10])
     await update.message.reply_text(
         "\n".join(lines), parse_mode=ParseMode.HTML,
         reply_markup=admin_keyboard())
@@ -3344,9 +4060,17 @@ async def mediasearch_cmd(update: Update,
         await update.message.reply_text(
             "Sorry, this file could not be found.")
         return
+    try:
+        counts = media_click_counts()
+    except Exception:
+        counts = {}
+    clicks, users = counts.get(code, (0, 0))
+    lock = ("\n🔒 পাসওয়ার্ড সুরক্ষিত"
+            if link_password_has(code) else "")
     await update.message.reply_text(
         f"🔗 File ID: <code>{code}</code>\n"
-        f"Share Link:\n{media_share_link(code)}",
+        f"Share Link:\n{media_share_link(code)}\n"
+        f"👆 ক্লিক: {clicks} ({users} জন){lock}",
         parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
     if not await send_stored_media(context, update.effective_chat.id,
                                    row):
@@ -3379,6 +4103,349 @@ async def mediadelete_cmd(update: Update,
         await update.message.reply_text(
             "❌ মুছা যায়নি, আবার চেষ্টা করুন।",
             reply_markup=admin_keyboard())
+
+
+async def show_my_files(msg, user, context) -> None:
+    """Files this user received before (clicks), newest first.
+    Used by /myfiles and the My files user button."""
+    try:
+        rows = media_user_files(user.id, limit=15)
+    except Exception:
+        log.exception("myfiles failed")
+        await msg.reply_text(
+            "❌ তালিকা দেখা যায়নি, আবার চেষ্টা করুন।",
+            reply_markup=main_keyboard())
+        return
+    if not rows:
+        await msg.reply_text(
+            "📭 তুমি এখনো কোনো ফাইল নাওনি।\n"
+            "শেয়ার লিংক খুললেই ফাইল এখানে জমা হবে।",
+            reply_markup=main_keyboard())
+        return
+    lines = ["📁 <b>আমার ফাইল</b> (সর্বশেষ 15টি)\n"]
+    for row in rows:
+        code = row["file_id_5digit"]
+        lock = " 🔒" if link_password_has(code) else ""
+        lines.append(f"File ID: <code>{code}</code>{lock}\n"
+                     f"{media_share_link(code)}")
+    await msg.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML,
+                         reply_markup=main_keyboard())
+
+
+async def myfiles_cmd(update: Update,
+                      context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if is_admin(user.id):
+        await update.message.reply_text(
+            "📁 এই তালিকা ইউজারদের জন্য — তোমার লিংক দেখতে "
+            "🔗 𝐒𝐡𝐚𝐫𝐞 𝐥𝐢𝐧𝐤 চাপো।",
+            reply_markup=admin_keyboard())
+        return
+    gate = await force_join_check(context, user.id)
+    if gate == "block":
+        await update.message.reply_text(
+            FJ_PROMPT_TEXT, parse_mode=ParseMode.HTML,
+            reply_markup=force_join_markup("start"))
+        return
+    await show_my_files(update.message, user, context)
+
+
+async def setlinkpass_cmd(update: Update,
+                          context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /setlinkpass 00001 1234 — password-protect a link."""
+    if not await _admin_only(update):
+        return
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "ব্যবহার: /setlinkpass 00001 পাসওয়ার্ড",
+            reply_markup=admin_keyboard())
+        return
+    code, password = args[0].strip(), args[1].strip()
+    if not is_valid_media_code(code):
+        await update.message.reply_text(
+            "Sorry, this file could not be found.")
+        return
+    try:
+        row = media_get_by_code(code)
+    except Exception:
+        row = None
+    if row is None:
+        await update.message.reply_text(
+            "Sorry, this file could not be found.")
+        return
+    try:
+        link_password_set(code, password)
+    except Exception:
+        log.exception("setlinkpass failed")
+        await update.message.reply_text(
+            "❌ পাসওয়ার্ড বসানো যায়নি, আবার চেষ্টা করুন।",
+            reply_markup=admin_keyboard())
+        return
+    await update.message.reply_text(
+        f"🔒 ফাইল <code>{code}</code>-এ পাসওয়ার্ড বসানো হয়েছে।\n"
+        "লিংক খুলতে এখন পাসওয়ার্ড লাগবে।",
+        parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+
+
+async def dellinkpass_cmd(update: Update,
+                          context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /dellinkpass 00001 — remove a link's password."""
+    if not await _admin_only(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "ব্যবহার: /dellinkpass 00001",
+            reply_markup=admin_keyboard())
+        return
+    code = args[0].strip()
+    if not is_valid_media_code(code):
+        await update.message.reply_text(
+            "Sorry, this file could not be found.")
+        return
+    try:
+        link_password_delete(code)
+    except Exception:
+        log.exception("dellinkpass failed")
+        await update.message.reply_text(
+            "❌ পাসওয়ার্ড তোলা যায়নি, আবার চেষ্টা করুন।",
+            reply_markup=admin_keyboard())
+        return
+    await update.message.reply_text(
+        f"🔓 ফাইল <code>{code}</code>-এর পাসওয়ার্ড তুলে দেওয়া হয়েছে।",
+        parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+
+
+async def setautodelete_cmd(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /setautodelete <hours> — delivered media is deleted
+    from the user's chat after this many hours (0 = off, max 168)."""
+    if not await _admin_only(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            f"ব্যবহার: /setautodelete ঘণ্টা (0 = বন্ধ, সর্বোচ্চ 168)\n"
+            f"এখন: {autodelete_hours() or 'বন্ধ'}",
+            reply_markup=admin_keyboard())
+        return
+    try:
+        hours = int(args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "ঘণ্টা সংখ্যায় লিখুন (যেমন /setautodelete 24)।",
+            reply_markup=admin_keyboard())
+        return
+    if hours < 0 or hours > 168:
+        await update.message.reply_text(
+            "০ থেকে ১৬৮ ঘণ্টার মধ্যে লিখুন।",
+            reply_markup=admin_keyboard())
+        return
+    try:
+        set_autodelete_hours(hours)
+    except Exception:
+        log.exception("setautodelete failed")
+        await update.message.reply_text(
+            "❌ সেভ হয়নি, আবার চেষ্টা করুন।",
+            reply_markup=admin_keyboard())
+        return
+    if hours == 0:
+        text = "⏳ অটো-ডিলিট বন্ধ হয়েছে।"
+    else:
+        text = (f"⏳ অটো-ডিলিট চালু হয়েছে — ইউজারকে দেওয়া ফাইল "
+                f"{hours} ঘণ্টা পর মুছে যাবে।")
+    await update.message.reply_text(text, reply_markup=admin_keyboard())
+
+
+async def addadmin_cmd(update: Update,
+                       context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Main admin only: /addadmin <user_id>."""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "ব্যবহার: /addadmin user_id",
+            reply_markup=admin_keyboard())
+        return
+    try:
+        target = int(args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "user_id সংখ্যায় লিখুন।", reply_markup=admin_keyboard())
+        return
+    if target == ADMIN_ID:
+        await update.message.reply_text(
+            "তুমি নিজেই মূল এডমিন।", reply_markup=admin_keyboard())
+        return
+    EXTRA_ADMINS.add(target)
+    try:
+        save_extra_admins(EXTRA_ADMINS)
+    except Exception:
+        log.exception("addadmin save failed")
+        await update.message.reply_text(
+            "❌ সেভ হয়নি, আবার চেষ্টা করুন।",
+            reply_markup=admin_keyboard())
+        return
+    await update.message.reply_text(
+        f"✅ এডমিন যোগ হয়েছে: <code>{target}</code>\n"
+        "সে এখন ইউজারদের মেসেজ পাবে আর উত্তর দিতে পারবে।",
+        parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+
+
+async def deladmin_cmd(update: Update,
+                       context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Main admin only: /deladmin <user_id>."""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "ব্যবহার: /deladmin user_id",
+            reply_markup=admin_keyboard())
+        return
+    try:
+        target = int(args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "user_id সংখ্যায় লিখুন।", reply_markup=admin_keyboard())
+        return
+    if target == ADMIN_ID:
+        await update.message.reply_text(
+            "🔒 মূল এডমিনকে সরানো যায় না।",
+            reply_markup=admin_keyboard())
+        return
+    if target not in EXTRA_ADMINS:
+        await update.message.reply_text(
+            "এই আইডি এডমিন নয়।", reply_markup=admin_keyboard())
+        return
+    EXTRA_ADMINS.discard(target)
+    try:
+        save_extra_admins(EXTRA_ADMINS)
+    except Exception:
+        log.exception("deladmin save failed")
+        await update.message.reply_text(
+            "❌ সেভ হয়নি, আবার চেষ্টা করুন।",
+            reply_markup=admin_keyboard())
+        return
+    await update.message.reply_text(
+        f"🗑️ এডমিন সরানো হয়েছে: <code>{target}</code>",
+        parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+
+
+async def listadmins_cmd(update: Update,
+                         context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Main admin only: /listadmins."""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+    lines = ["👑 <b>এডমিন তালিকা</b>\n",
+             f"মূল এডমিন: <code>{ADMIN_ID}</code>"]
+    for aid in sorted(EXTRA_ADMINS - {ADMIN_ID}):
+        lines.append(f"• <code>{aid}</code>")
+    if len(lines) == 2:
+        lines.append("\nআর কোনো এডমিন নেই।")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML,
+        reply_markup=admin_keyboard())
+
+
+# ---------------- Inline mode ----------------
+# @Mr_Chat1bot <খোঁজ> in any chat: matching share links appear as
+# results. Needs inline mode enabled for the bot in BotFather
+# (/setinline) — the code alone cannot switch it on. Only members
+# of the force-join group see results; password-protected links
+# are never listed (a tap would bypass the password).
+
+def _inline_result(row):
+    code = row["file_id_5digit"]
+    mtype = row["media_type"]
+    file_id = row["telegram_file_id"]
+    title = row["original_filename"] or f"File {code}"
+    desc = (row["original_caption"] or "").strip()
+    desc = desc[:80] if desc else mtype
+    caption = row["original_caption"] or None
+    if mtype == "photo":
+        return InlineQueryResultCachedPhoto(
+            id=code, photo_file_id=file_id, title=title,
+            description=desc, caption=caption)
+    if mtype == "video":
+        return InlineQueryResultCachedVideo(
+            id=code, video_file_id=file_id, title=title,
+            description=desc, caption=caption)
+    if mtype == "document":
+        return InlineQueryResultCachedDocument(
+            id=code, document_file_id=file_id, title=title,
+            description=desc, caption=caption)
+    if mtype == "audio":
+        return InlineQueryResultCachedAudio(
+            id=code, audio_file_id=file_id, caption=caption)
+    if mtype == "voice":
+        return InlineQueryResultCachedVoice(
+            id=code, voice_file_id=file_id, title=title)
+    if mtype == "animation":
+        return InlineQueryResultCachedGif(
+            id=code, gif_file_id=file_id, title=title,
+            caption=caption)
+    if mtype == "sticker":
+        return InlineQueryResultCachedSticker(
+            id=code, sticker_file_id=file_id)
+    return None
+
+
+async def inline_query_handler(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.inline_query
+    user = query.from_user if query else None
+    if not query or not user:
+        return
+    if not is_admin(user.id):
+        gate = await force_join_check(context, user.id)
+        if gate == "block":
+            await query.answer(
+                [], switch_pm_text="🔐 গ্রুপে জয়েন করুন",
+                switch_pm_parameter="start", cache_time=0)
+            return
+    text = (query.query or "").strip()
+    try:
+        rows = media_search(text, limit=50)
+    except Exception:
+        log.exception("inline search failed")
+        rows = []
+    results = []
+    for row in rows:
+        if link_password_has(row["file_id_5digit"]):
+            continue
+        try:
+            res = _inline_result(row)
+        except Exception:
+            res = None
+        if res is not None:
+            results.append(res)
+    try:
+        await query.answer(results, cache_time=10, is_personal=True)
+    except Exception:
+        log.exception("inline answer failed")
+
+
+async def chosen_inline_handler(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap on an inline result = a click on that share link."""
+    chosen = update.chosen_inline_result
+    if not chosen or not chosen.from_user:
+        return
+    code = chosen.result_id or ""
+    if not is_valid_media_code(code):
+        return
+    if is_admin(chosen.from_user.id):
+        return
+    try:
+        media_record_click(code, chosen.from_user.id)
+    except Exception:
+        pass
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3414,6 +4481,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("mediastats", mediastats_cmd))
     app.add_handler(CommandHandler("mediasearch", mediasearch_cmd))
     app.add_handler(CommandHandler("mediadelete", mediadelete_cmd))
+    app.add_handler(CommandHandler("myfiles", myfiles_cmd))
+    app.add_handler(CommandHandler("setlinkpass", setlinkpass_cmd))
+    app.add_handler(CommandHandler("dellinkpass", dellinkpass_cmd))
+    app.add_handler(CommandHandler("setautodelete", setautodelete_cmd))
+    app.add_handler(CommandHandler("addadmin", addadmin_cmd))
+    app.add_handler(CommandHandler("deladmin", deladmin_cmd))
+    app.add_handler(CommandHandler("listadmins", listadmins_cmd))
     app.add_handler(CallbackQueryHandler(lang_callback,
                                          pattern=r"^lang:(bn|en|zh)$"))
     app.add_handler(CallbackQueryHandler(translate_callback,
@@ -3429,6 +4503,8 @@ def build_app() -> Application:
         force_join_member_update,
         chat_member_types=ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatJoinRequestHandler(force_join_request_update))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
+    app.add_handler(ChosenInlineResultHandler(chosen_inline_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND,
                                     handle_message))
     app.add_error_handler(error_handler)
